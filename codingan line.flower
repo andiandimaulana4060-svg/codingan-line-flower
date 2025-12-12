@@ -1,0 +1,401 @@
+// ===== PIN CONFIGURATION =====
+// Motor Kiri
+#define ENA 5
+#define IN1 6
+#define IN2 7
+
+// Motor Kanan
+#define IN3 8
+#define IN4 9
+#define ENB 10
+
+// BFD-1000 Sensor Outputs
+#define OUT1 A0  // Sensor Kiri Luar
+#define OUT2 A1  // Sensor Kiri
+#define OUT3 A2  // Sensor Tengah
+#define OUT4 A3  // Sensor Kanan
+#define OUT5 A4  // Sensor Kanan Luar
+
+// ===== SPEED CONFIGURATION =====
+#define BASE_SPEED 170        // Kecepatan dasar saat maju lurus
+#define MAX_SPEED 255         // Kecepatan maksimum
+#define MIN_SPEED 80          // Kecepatan minimum
+#define TURN_SPEED_SLOW 120   // Kecepatan belok ringan
+#define TURN_SPEED_SHARP 150  // Kecepatan belok tajam
+
+// ===== PID PARAMETERS =====
+float Kp = 30;     // Proportional gain
+float Ki = 0.05;   // Integral gain
+float Kd = 20;     // Derivative gain
+
+// ===== VARIABLES =====
+int sensor[5];                    // Array pembacaan sensor
+int lastError = 0;                // Error sebelumnya untuk derivative
+float integral = 0;               // Akumulasi error untuk integral
+int lastPosition = 0;             // Posisi terakhir yang valid
+unsigned long lastLineTime = 0;   // Waktu terakhir sensor mendeteksi garis
+bool isRunning = true;            // Status robot
+
+// ===== SAFETY CHECK =====
+#define SENSOR_CHECK_INTERVAL 100  // Cek sensor setiap 100ms
+unsigned long lastSensorCheck = 0;
+int noLineCounter = 0;             // Counter saat tidak ada garis terdeteksi
+
+void setup() {
+  // Setup motor pins
+  pinMode(ENA, OUTPUT);
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+  pinMode(ENB, OUTPUT);
+  
+  // Setup sensor pins
+  pinMode(OUT1, INPUT);
+  pinMode(OUT2, INPUT);
+  pinMode(OUT3, INPUT);
+  pinMode(OUT4, INPUT);
+  pinMode(OUT5, INPUT);
+  
+  // Serial monitor
+  Serial.begin(9600);
+  Serial.println("======================================");
+  Serial.println("  LINE FOLLOWER - BFD-1000 SENSOR");
+  Serial.println("======================================");
+  Serial.println();
+  Serial.println("Sensor Type: BFD-1000 (Digital Output)");
+  Serial.println("Logic: BLACK=1 (HIGH), WHITE=0 (LOW)");
+  Serial.println();
+  Serial.println("PENTING:");
+  Serial.println("- Pastikan sensor 2-3mm dari permukaan");
+  Serial.println("- Sensor akan mati jika terlalu jauh");
+  Serial.println("- Robot akan berhenti jika sensor tidak stabil");
+  Serial.println();
+  Serial.println("Starting in 3 seconds...");
+  delay(3000);
+  Serial.println("START!");
+  Serial.println("--------------------------------------");
+}
+
+void loop() {
+  // Baca sensor BFD-1000
+  readSensors();
+  
+  // Cek apakah sensor terlalu jauh dari permukaan
+  if (checkSensorDistance()) {
+    // Hitung posisi garis
+    int position = calculateLinePosition();
+    
+    // Hitung error (target = 0 untuk tengah)
+    int error = position;
+    
+    // PID Controller
+    integral += error;
+    integral = constrain(integral, -100, 100); // Anti-windup
+    
+    int derivative = error - lastError;
+    float correction = (Kp * error) + (Ki * integral) + (Kd * derivative);
+    lastError = error;
+    
+    // Hitung kecepatan motor
+    int leftSpeed = BASE_SPEED + correction;
+    int rightSpeed = BASE_SPEED - correction;
+    
+    // Batasi kecepatan
+    leftSpeed = constrain(leftSpeed, MIN_SPEED, MAX_SPEED);
+    rightSpeed = constrain(rightSpeed, MIN_SPEED, MAX_SPEED);
+    
+    // Handle kondisi khusus
+    handleSpecialCases();
+    
+    // Jalankan motor
+    if (isRunning) {
+      moveMotor(leftSpeed, rightSpeed);
+    }
+    
+    // Debug output
+    printDebug(position, error, correction, leftSpeed, rightSpeed);
+    
+    // Reset counter
+    noLineCounter = 0;
+    lastLineTime = millis();
+    
+  } else {
+    // Sensor terlalu jauh atau tidak stabil
+    handleSensorError();
+  }
+  
+  delay(5);
+}
+
+// ===== BACA SENSOR BFD-1000 =====
+void readSensors() {
+  sensor[0] = digitalRead(OUT1);
+  sensor[1] = digitalRead(OUT2);
+  sensor[2] = digitalRead(OUT3);
+  sensor[3] = digitalRead(OUT4);
+  sensor[4] = digitalRead(OUT5);
+}
+
+// ===== CEK JARAK SENSOR =====
+// Return true jika sensor dalam jarak yang baik
+bool checkSensorDistance() {
+  int activeCount = 0;
+  
+  // Hitung berapa sensor yang aktif
+  for (int i = 0; i < 5; i++) {
+    if (sensor[i] == 1) activeCount++;
+  }
+  
+  // Jika semua sensor 0 (kemungkinan sensor terlalu jauh)
+  if (activeCount == 0) {
+    noLineCounter++;
+    
+    // Jika 10x berturut-turut tidak ada garis (100ms)
+    if (noLineCounter > 10) {
+      return false; // Sensor error / terlalu jauh
+    }
+  }
+  
+  return true;
+}
+
+// ===== HITUNG POSISI GARIS =====
+// Return: -40 (kiri luar) s/d +40 (kanan luar)
+int calculateLinePosition() {
+  long weightedSum = 0;
+  int sensorSum = 0;
+  
+  // Weight untuk tiap sensor: -40, -20, 0, 20, 40
+  int weights[5] = {-40, -20, 0, 20, 40};
+  
+  for (int i = 0; i < 5; i++) {
+    if (sensor[i] == 1) {
+      weightedSum += weights[i];
+      sensorSum++;
+    }
+  }
+  
+  // Jika ada sensor yang mendeteksi
+  if (sensorSum > 0) {
+    lastPosition = weightedSum / sensorSum;
+    return lastPosition;
+  }
+  
+  // Jika tidak ada yang mendeteksi, gunakan posisi terakhir
+  return lastPosition;
+}
+
+// ===== HANDLE KONDISI KHUSUS =====
+void handleSpecialCases() {
+  int blackCount = 0;
+  
+  // Hitung sensor yang mendeteksi hitam
+  for (int i = 0; i < 5; i++) {
+    if (sensor[i] == 1) blackCount++;
+  }
+  
+  // CASE 1: Semua sensor hitam (persimpangan / T-junction)
+  if (blackCount == 5) {
+    Serial.println(">>> PERSIMPANGAN TERDETEKSI");
+    moveForward(BASE_SPEED);
+    delay(150); // Lewati persimpangan
+  }
+  
+  // CASE 2: Hanya sensor luar kiri (belok tajam kiri)
+  else if (sensor[0] == 1 && sensor[1] == 0 && sensor[2] == 0 && sensor[3] == 0 && sensor[4] == 0) {
+    Serial.println(">>> BELOK TAJAM KIRI");
+    sharpTurnLeft();
+  }
+  
+  // CASE 3: Sensor kiri luar + kiri (belok tajam kiri)
+  else if (sensor[0] == 1 && sensor[1] == 1 && sensor[2] == 0) {
+    Serial.println(">>> BELOK KIRI");
+    turnLeft();
+  }
+  
+  // CASE 4: Hanya sensor luar kanan (belok tajam kanan)
+  else if (sensor[0] == 0 && sensor[1] == 0 && sensor[2] == 0 && sensor[3] == 0 && sensor[4] == 1) {
+    Serial.println(">>> BELOK TAJAM KANAN");
+    sharpTurnRight();
+  }
+  
+  // CASE 5: Sensor kanan + kanan luar (belok tajam kanan)
+  else if (sensor[2] == 0 && sensor[3] == 1 && sensor[4] == 1) {
+    Serial.println(">>> BELOK KANAN");
+    turnRight();
+  }
+  
+  // CASE 6: Tidak ada sensor yang mendeteksi (kehilangan garis)
+  else if (blackCount == 0) {
+    unsigned long timeLost = millis() - lastLineTime;
+    
+    if (timeLost > 300) {  // Kehilangan garis > 300ms
+      Serial.println(">>> MENCARI GARIS...");
+      searchLine();
+    }
+  }
+}
+
+// ===== HANDLE SENSOR ERROR =====
+void handleSensorError() {
+  Serial.println("!!! PERINGATAN: SENSOR TERLALU JAUH !!!");
+  Serial.println("!!! CEK JARAK SENSOR KE PERMUKAAN !!!");
+  Serial.println("!!! ROBOT BERHENTI !!!");
+  
+  // Berhenti total
+  stopMotor();
+  isRunning = false;
+  
+  // Blink LED atau buzzer bisa ditambahkan di sini
+  
+  // Tunggu sampai sensor kembali normal
+  while (!checkSensorDistance()) {
+    readSensors();
+    delay(100);
+  }
+  
+  Serial.println(">>> Sensor kembali normal, melanjutkan...");
+  isRunning = true;
+  delay(500);
+}
+
+// ===== FUNGSI MENCARI GARIS =====
+void searchLine() {
+  // Putar sesuai posisi terakhir
+  if (lastPosition < 0) {
+    // Garis terakhir di kiri, putar kiri
+    turnLeft();
+  } else {
+    // Garis terakhir di kanan, putar kanan
+    turnRight();
+  }
+  
+  // Coba cari garis selama 1.5 detik
+  unsigned long searchStart = millis();
+  while (millis() - searchStart < 1500) {
+    readSensors();
+    
+    int blackCount = 0;
+    for (int i = 0; i < 5; i++) {
+      if (sensor[i] == 1) blackCount++;
+    }
+    
+    if (blackCount > 0) {
+      Serial.println(">>> GARIS DITEMUKAN!");
+      lastLineTime = millis();
+      return;
+    }
+  }
+  
+  // Jika tidak ketemu, berhenti
+  Serial.println(">>> GARIS TIDAK DITEMUKAN - BERHENTI");
+  stopMotor();
+  isRunning = false;
+  while(1); // Stop permanent
+}
+
+// ===== FUNGSI GERAKAN MOTOR =====
+
+void moveMotor(int leftSpeed, int rightSpeed) {
+  // Motor Kiri
+  if (leftSpeed >= 0) {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+    analogWrite(ENA, leftSpeed);
+  } else {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    analogWrite(ENA, abs(leftSpeed));
+  }
+  
+  // Motor Kanan
+  if (rightSpeed >= 0) {
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+    analogWrite(ENB, rightSpeed);
+  } else {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+    analogWrite(ENB, abs(rightSpeed));
+  }
+}
+
+void moveForward(int speed) {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, speed);
+  analogWrite(ENB, speed);
+}
+
+void turnLeft() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, TURN_SPEED_SLOW);
+}
+
+void sharpTurnLeft() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);  // Mundur
+  digitalWrite(IN3, HIGH);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, TURN_SPEED_SHARP);
+  analogWrite(ENB, TURN_SPEED_SHARP);
+}
+
+void turnRight() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, TURN_SPEED_SLOW);
+  analogWrite(ENB, 0);
+}
+
+void sharpTurnRight() {
+  digitalWrite(IN1, HIGH);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);  // Mundur
+  analogWrite(ENA, TURN_SPEED_SHARP);
+  analogWrite(ENB, TURN_SPEED_SHARP);
+}
+
+void stopMotor() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+// ===== DEBUG PRINT =====
+void printDebug(int pos, int err, float corr, int lSpeed, int rSpeed) {
+  Serial.print("Pos:");
+  Serial.print(pos);
+  Serial.print(" Err:");
+  Serial.print(err);
+  Serial.print(" Corr:");
+  Serial.print(corr, 1);
+  Serial.print(" L:");
+  Serial.print(lSpeed);
+  Serial.print(" R:");
+  Serial.print(rSpeed);
+  Serial.print(" | ");
+  
+  // Tampilkan status sensor
+  for (int i = 0; i < 5; i++) {
+    if (sensor[i] == 1) {
+      Serial.print("■"); // Hitam
+    } else {
+      Serial.print("□"); // Putih
+    }
+  }
+  Serial.println();
+}
